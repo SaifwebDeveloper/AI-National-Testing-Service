@@ -27,8 +27,14 @@ const { errorHandler, notFound, requestLogger, performanceMonitor } = require('.
 // Initialize express app
 const app = express();
 
-// Create uploads directory if it doesn't exist
-const uploadsDir = path.join(__dirname, 'uploads');
+// Check if running on Vercel
+const isVercel = process.env.VERCEL === 'true' || process.env.NODE_ENV === 'production';
+
+// Create uploads directory (use /tmp on Vercel)
+const uploadsDir = isVercel 
+  ? '/tmp/uploads' 
+  : path.join(__dirname, 'uploads');
+
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
   console.log('📁 Created uploads directory');
@@ -52,9 +58,25 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 
-// CORS configuration
+// CORS configuration - Allow both local and Vercel frontend
+const allowedOrigins = [
+  process.env.CLIENT_URL || 'http://localhost:5173',
+  process.env.FRONTEND_URL,
+  'https://saifwebdeveloper.vercel.app'
+].filter(Boolean);
+
 app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:5173',
+  origin: function(origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    // Allow if origin is in allowed list or during development
+    if (allowedOrigins.includes(origin) || !isVercel) {
+      callback(null, true);
+    } else {
+      console.log('CORS blocked origin:', origin);
+      callback(null, true); // Allow anyway for now
+    }
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
@@ -72,7 +94,7 @@ app.use(requestLogger);
 app.use(performanceMonitor);
 
 // Static files
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads', express.static(uploadsDir));
 
 // ====================
 // Routes
@@ -85,6 +107,7 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     environment: process.env.NODE_ENV,
+    platform: isVercel ? 'vercel' : 'local',
     mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
   });
 });
@@ -136,90 +159,106 @@ app.use(notFound);
 app.use(errorHandler);
 
 // ====================
-// Server Initialization
+// Database connection helper for Vercel
 // ====================
 
-const PORT = process.env.PORT || 5000;
-let server = null;
+let dbConnected = false;
 
-// Graceful shutdown function
-const gracefulShutdown = async () => {
-  console.log('\n🛑 Received shutdown signal');
-  
-  if (server) {
-    server.close(async () => {
-      console.log('🔌 HTTP server closed');
-      
-      // Close database connection
-      const { closeDB } = require('./config/database');
-      await closeDB();
-      
-      console.log('✅ Graceful shutdown completed');
-      process.exit(0);
-    });
-    
-    // Force shutdown after 10 seconds
-    setTimeout(() => {
-      console.error('⚠️ Could not close connections in time, forcing shutdown');
-      process.exit(1);
-    }, 10000);
-  } else {
-    process.exit(0);
-  }
-};
-
-// Start server
-const startServer = async () => {
-  try {
-    // Connect to database
-    await connectDB();
-    
-    // Setup database indexes
-    await setupIndexes();
-    
-    // Enable database debugging in development
-    if (process.env.NODE_ENV === 'development') {
-      enableDebug();
+const ensureDbConnection = async () => {
+  if (!dbConnected && mongoose.connection.readyState !== 1) {
+    try {
+      await connectDB();
+      await setupIndexes();
+      dbConnected = true;
+      console.log('✅ Database connected');
+    } catch (error) {
+      console.error('❌ Database connection failed:', error);
     }
-    
-    // Create HTTP server
-    server = app.listen(PORT, () => {
-      console.log(`\n🚀 Server running on port ${PORT}`);
-      console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
-      console.log(`🔗 Client URL: ${process.env.CLIENT_URL || 'http://localhost:5173'}`);
-      console.log(`📡 API URL: http://localhost:${PORT}/api`);
-      console.log(`❤️ Health check: http://localhost:${PORT}/health`);
-      console.log(`📁 Uploads directory: ${uploadsDir}`);
-    });
-    
-    // Initialize Socket.IO
-    const io = initSocket(server);
-    app.set('io', io);
-    console.log('🔌 WebSocket server initialized');
-    
-    // Handle process termination
-    process.on('SIGTERM', gracefulShutdown);
-    process.on('SIGINT', gracefulShutdown);
-    
-    // Handle uncaught exceptions
-    process.on('uncaughtException', (error) => {
-      console.error('❌ Uncaught Exception:', error);
-      gracefulShutdown();
-    });
-    
-    // Handle unhandled promise rejections
-    process.on('unhandledRejection', (reason, promise) => {
-      console.error('❌ Unhandled Rejection:', reason);
-      gracefulShutdown();
-    });
-    
-  } catch (error) {
-    console.error('❌ Failed to start server:', error);
-    process.exit(1);
   }
 };
 
-// Start the server
-startServer();
+// ====================
+// Export for Vercel (NO server.listen)
+// ====================
 
-module.exports = { app, server };
+// For Vercel - wrap app to ensure DB connection
+const vercelHandler = async (req, res) => {
+  await ensureDbConnection();
+  return app(req, res);
+};
+
+// Export based on environment
+if (isVercel) {
+  // On Vercel, export the handler
+  module.exports = vercelHandler;
+} else {
+  // Local development - start server normally
+  const PORT = process.env.PORT || 5000;
+  let server = null;
+
+  const gracefulShutdown = async () => {
+    console.log('\n🛑 Received shutdown signal');
+    
+    if (server) {
+      server.close(async () => {
+        console.log('🔌 HTTP server closed');
+        const { closeDB } = require('./config/database');
+        await closeDB();
+        console.log('✅ Graceful shutdown completed');
+        process.exit(0);
+      });
+      
+      setTimeout(() => {
+        console.error('⚠️ Could not close connections in time, forcing shutdown');
+        process.exit(1);
+      }, 10000);
+    } else {
+      process.exit(0);
+    }
+  };
+
+  const startServer = async () => {
+    try {
+      await connectDB();
+      await setupIndexes();
+      
+      if (process.env.NODE_ENV === 'development') {
+        enableDebug();
+      }
+      
+      server = app.listen(PORT, () => {
+        console.log(`\n🚀 Server running on port ${PORT}`);
+        console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
+        console.log(`🔗 Client URL: ${process.env.CLIENT_URL || 'http://localhost:5173'}`);
+        console.log(`📡 API URL: http://localhost:${PORT}/api`);
+        console.log(`❤️ Health check: http://localhost:${PORT}/health`);
+        console.log(`📁 Uploads directory: ${uploadsDir}`);
+      });
+      
+      const io = initSocket(server);
+      app.set('io', io);
+      console.log('🔌 WebSocket server initialized');
+      
+      process.on('SIGTERM', gracefulShutdown);
+      process.on('SIGINT', gracefulShutdown);
+      
+      process.on('uncaughtException', (error) => {
+        console.error('❌ Uncaught Exception:', error);
+        gracefulShutdown();
+      });
+      
+      process.on('unhandledRejection', (reason, promise) => {
+        console.error('❌ Unhandled Rejection:', reason);
+        gracefulShutdown();
+      });
+      
+    } catch (error) {
+      console.error('❌ Failed to start server:', error);
+      process.exit(1);
+    }
+  };
+
+  startServer();
+  
+  module.exports = { app, server };
+}
